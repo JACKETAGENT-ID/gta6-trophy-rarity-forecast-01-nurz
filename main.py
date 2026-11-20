@@ -1,64 +1,48 @@
-"""GTA VI trophy rarity forecast (nurz entry) -- dilution + progression model.
+"""GTA VI trophy rarity forecast (nurz entry) v2 -- refresh-anchored
+earners/players decomposition.
 
 Forecasts each trophy's Exophase earn rate at the case target by working in
-*counts*, not by extrapolating the rate itself:
+*counts*:  rate_target = 100 * E_target / P_target.
 
-    rate_target = 100 * E_target / P_target
+Two regimes, split on what the case history shows:
 
-where P is Exophase's players-tracked count and E is how many of them earned
-the trophy.  Two forces move E and P in opposite directions:
+  * FLAT history (every read identical, as on launch night): the page has
+    not refreshed yet, so the next refresh is the whole story. The kit
+    documents that first refresh exactly: 638 players tracked and 943
+    trophies earned became 3,868 players and 4,276 trophies earned, every
+    rate but the one at 100% lower. So P jumps ~6.06x, and the 103 extra
+    earners (4,276-3,868 minus 943-638) went almost entirely to trophies a
+    new player can earn in their first hours -- the main-story path
+    (chapters, the final mission, the story missions) and the quickest
+    one-off activities (fishing challenge, arcade game, a cocktail, the
+    bowling alley). Grinds, the platinum and late-story strands gain ~no
+    earners at a refresh: nobody finishes 250 stunts or 100% completion
+    in their first hours. The extra earners are spread over the
+    early-earnable trophies in proportion to their current earners.
+    After the jump, ordinary hazard progression runs over the horizon
+    (negligible over 90 minutes: every class lag is >= 2h).
 
-  * Dilution: new players arrive (P grows) having earned almost nothing yet,
-    which drags every rate down.
-  * Progression: players already tracked keep playing and earn trophies at a
-    per-trophy hazard, which pushes rates up -- fast for early-story trophies,
-    slow for endgame grinds and the platinum.
+  * GROWTH history (refreshes observed): P_target from the log-linear
+    growth of the last 24h of reads (capped 2x/day, 8x total), and each
+    trophy's new-player earn rate measured from dE/dP across the jumps,
+    blended with a hazard-based prior (players progress at a per-trophy
+    hourly hazard after a reachability lag). No flat arrival-rate floor:
+    a brand-new tracked player has earned ~nothing yet, so the arrival
+    rate is the measured marginal rate, not a class prior.
 
-Players projection.  From the case history, the daily growth factor over the
-last 24h of reads is measured (log-linear on players-tracked) and carried
-forward to the target, capped at 2x/day and 8x total.  When the history shows
-no player growth at all (every read identical, as on launch night), one
-refresh-scale jump is assumed: the first refresh the house recorded multiplied
-tracked players by about 6x (638 -> 3,868), so P_target = 6.06 * P_last.
-
-Earned-count projection.  For each trophy i, with horizon H hours:
-
-    E_t = E_last
-        + (P_last - E_last) * (1 - exp(-lam_i * max(0, H - lag_i)))
-        + (P_t - P_last) * beta_i
-
-  * The middle term is existing players progressing: lam_i is the hourly
-    hazard that a not-yet-earner earns the trophy, after a lag_i (hours of
-    play needed before the trophy is even reachable).
-  * beta_i is the share of *new* players who have earned the trophy by the
-    target: their arrival earn rate m_i plus their own progression over
-    their average age H/2 at the target:
-        beta_i = m_i + (1 - m_i) * (1 - exp(-lam_i * max(0, H/2 - lag_i)))
-  * m_i is measured from the history when it shows refreshes: over each
-    interval where players-tracked jumps, the marginal earn rate of the
-    newcomers is dE_i / dP (earned-count growth attributed to the arrivals).
-    With no such interval in the history, m_i falls back to a class prior.
-
-Trophy classes (from tier + description keywords, deterministic):
-  plat   platinum -- almost nobody in week one.
-  grind  100% completion, big counters (250 stunts, 100 locations, 50
-         challenges, card sets, gold medals, ...).
-  late   the final mission / end of the story.
-  mid    chapters 3-4 and stranger side-mission strands.
-  early  chapters 1-2 and the opening missions.
-  misc   everything else (one-off activities, shops, collectibles).
-
-Each class carries (lam, lag, m0 arrival rate, ceiling on the median rate).
 The 100% trophy (every tracked player has it, and it survived the first
 6x refresh at exactly 100%) is forecast at ~100%.
 
-Spread.  Quantiles sit on the logit scale around the median with
-sigma = sqrt(0.25 * days + extra^2 + (0.15 * |logit move|)^2): a random-walk
-term, an extra term for refresh risk (1.0 logit when the history never
-showed a refresh, 0.45 once refreshes are observed), and a term that widens
-the band the further the median moved from the last read.
+Spread. Quantiles sit on the logit scale around the median with
+sigma = sqrt(0.05 + 0.10 * days + refresh_var + (0.05 * |logit move|)^2):
+a small base term, a random-walk term that grows with the horizon, a
+refresh-risk term (0.04 when the history never showed a refresh, 0.01
+once refreshes are observed), and a term for how far the median moved.
+Over a 90-minute horizon with a flat history sigma is ~0.32 -- wide
+enough to be honest about which trophies the refresh lifts, narrow
+enough not to pay for width the forecast does not need.
 
-Python 3.13, standard library only.  Deterministic: no network, no clock,
+Python 3.13, standard library only. Deterministic: no network, no clock,
 no randomness; the same input always yields the same bytes.
 """
 
@@ -74,23 +58,33 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-# First refresh the house recorded: 638 -> 3,868 tracked players.
-REFRESH_JUMP = 3868.0 / 638.0
+# The first refresh, as the kit documents it (competition.yaml / RULES):
+# launch night 638 players tracked, 943 trophies earned; refreshed to
+# 3,868 players, 4,276 trophies earned.
+FIRST_P = 638.0
+FIRST_EARNED = 943.0
+REFRESH_P = 3868.0
+REFRESH_EARNED = 4276.0
+REFRESH_JUMP = REFRESH_P / FIRST_P  # ~6.06x players at a refresh
+# Extra earners the refresh brought to non-100% trophies, per new player:
+# (4276-3868) - (943-638) = 103 earners over 3868-638 = 3230 new players.
+REFRESH_EXTRA_PER_NEW = ((REFRESH_EARNED - REFRESH_P)
+                         - (FIRST_EARNED - FIRST_P)) / (REFRESH_P - FIRST_P)
+
 MAX_DAILY_GROWTH = 2.0
 MAX_PLAYER_MULT = 8.0
 
-# class: (hourly hazard lam, lag hours, arrival earn rate m0, median ceiling %)
-# Hazards are population-average rates: in week one only a small share of
-# tracked players attempts (let alone finishes) grinds or the story's end,
-# so late/grind/platinum hazards stay low even though a few hardcore
-# players race ahead.
+# class: (hourly hazard lam, lag hours, median ceiling %)
+# Hazards are population-average rates. The platinum is gated by the
+# slowest trophy (100% completion), so its hazard is ~nil in week one;
+# grinds need dozens of hours of play, so theirs stays low too.
 CLASSES = {
-    "plat":  (0.0004, 72.0, 0.0005, 5.0),
-    "grind": (0.0006, 48.0, 0.001, 25.0),
-    "late":  (0.001, 24.0, 0.001, 35.0),
-    "mid":   (0.003, 8.0, 0.002, 60.0),
-    "early": (0.008, 2.0, 0.002, 90.0),
-    "misc":  (0.005, 4.0, 0.005, 75.0),
+    "plat":  (0.00002, 120.0, 5.0),
+    "grind": (0.0003, 72.0, 25.0),
+    "late":  (0.001, 24.0, 35.0),
+    "mid":   (0.003, 8.0, 60.0),
+    "early": (0.008, 2.0, 90.0),
+    "misc":  (0.005, 4.0, 75.0),
 }
 
 GRIND_WORDS = (
@@ -98,6 +92,11 @@ GRIND_WORDS = (
     "50 challenges", "collectible card", "20 different races",
     "every location", "every spot", "5 bank vaults", "100 vehicles",
     "purchase all garage",
+)
+
+# One-off activities a player can do within minutes of starting.
+QUICK_WORDS = (
+    "fishing challenge", "arcade game", "cocktail", "bowling alley",
 )
 
 
@@ -148,6 +147,32 @@ def classify(trophy: dict) -> str:
     return "misc"
 
 
+def early_earnable(trophy: dict) -> bool:
+    """True when a new player can earn this trophy in their first hours.
+
+    The main-story path (chapters, the final mission, the story missions)
+    plus the quickest one-off activities. Grinds, stranger strands and
+    late-story trophies are excluded: they need hours-to-days of play.
+    """
+    if trophy["tier"] == "platinum":
+        return False
+    hay = (trophy["name"] + " " + trophy["description"]).lower()
+    if any(w in hay for w in GRIND_WORDS):
+        return False
+    if any(w in hay for w in QUICK_WORDS):
+        return True
+    # The story path lives in the DESCRIPTION ("Complete Chapter 1.",
+    # "Complete the final mission.", "Complete Breakfast Run.", ...):
+    # the name comes first in the combined text, so test the
+    # description on its own. "for ..." (a stranger's final mission)
+    # and "strands" need a longer play session, so they stay out.
+    desc = trophy["description"].lower()
+    if desc.startswith("complete ") and " for " not in desc \
+            and "strands" not in desc:
+        return True
+    return False
+
+
 def last_rates(history: list, n: int) -> list:
     """Last non-null rate per trophy (rates may be null in some reads)."""
     out = [None] * n
@@ -158,19 +183,13 @@ def last_rates(history: list, n: int) -> list:
     return [0.0 if r is None else r for r in out]
 
 
-def project_players(history: list, horizon_hours: float):
-    """Return (P_target, flat_history). P_target from the last 24h growth."""
+def project_players_growth(history: list, horizon_hours: float) -> float:
+    """P_target from the log-linear growth of the last 24h of reads."""
     times = [parse_time(r["at"]) for r in history]
     players = [float(r["players_tracked"]) for r in history]
     t0 = times[0]
     hours = [(t - t0).total_seconds() / 3600.0 for t in times]
     p_last = players[-1]
-    if max(players) == min(players):
-        # No refresh ever observed: assume one refresh-scale jump.
-        if horizon_hours >= 1.0:
-            return p_last * REFRESH_JUMP, True
-        return p_last, True
-    # Reference read ~24h before the last one (or the first read).
     t_last = hours[-1]
     ref = 0
     for j in range(len(hours) - 1, -1, -1):
@@ -179,22 +198,30 @@ def project_players(history: list, horizon_hours: float):
             break
     span = t_last - hours[ref]
     if span < 1.0 or players[ref] <= 0:
-        return p_last, False
+        return p_last
     daily = (p_last / players[ref]) ** (24.0 / span)
     daily = min(daily, MAX_DAILY_GROWTH)
     mult = daily ** (horizon_hours / 24.0)
-    return p_last * min(mult, MAX_PLAYER_MULT), False
+    return p_last * min(mult, MAX_PLAYER_MULT)
 
 
-def newcomer_rates(history: list, trophies: list, classes: list) -> list:
+def newcomer_rates(history: list, trophies: list, classes: list,
+                   horizon_hours: float) -> list:
     """Marginal earn rate of arriving players, per trophy.
 
-    Measured from refresh intervals (players-tracked jumps): dE/dP, weighted
-    by the size of each jump.  Falls back to the class prior where the
-    history shows no usable jump.
+    Measured from refresh intervals (players-tracked jumps): dE/dP,
+    weighted by jump size, blended with a hazard-based prior (a new
+    player earns by the target only if they progress past the trophy's
+    lag in their average age, horizon/2). With no usable jump the prior
+    alone is used -- and the prior has no flat arrival floor: brand-new
+    tracked players have earned ~nothing yet.
     """
     n = len(trophies)
-    prior = [CLASSES[c][2] for c in classes]
+    prior = []
+    for c in classes:
+        lam, lag, _ceil = CLASSES[c]
+        prior.append(1.0 - math.exp(
+            -lam * max(0.0, horizon_hours / 2.0 - lag)))
     if len(history) < 2:
         return prior
     num = [0.0] * n
@@ -233,44 +260,74 @@ def forecast_case(case: dict) -> dict:
 
     rates = last_rates(history, n)
     p_last = float(history[-1]["players_tracked"])
-    p_target, flat = project_players(history, horizon_hours)
-    new_players = max(0.0, p_target - p_last)
+    players = [float(r["players_tracked"]) for r in history]
+    flat = max(players) == min(players)
     classes = [classify(t) for t in trophies]
-    arrivals = newcomer_rates(history, trophies, classes)
 
-    extra = 1.0 if flat else 0.45
+    if flat:
+        # One refresh-scale jump, then hazard progression over the horizon.
+        p_target = p_last * REFRESH_JUMP
+        # A later refresh after a long flat stretch adds a little more.
+        p_target *= min(2.0, 1.0 + 0.1 * days)
+        new_players = max(0.0, p_target - p_last)
+        # The refresh's extra earners go to early-earnable trophies,
+        # in proportion to their current earners.
+        early = [early_earnable(t) for t in trophies]
+        earners = [rates[i] / 100.0 * p_last for i in range(n)]
+        early_sum = sum(earners[i] for i in range(n)
+                        if early[i] and rates[i] < 99.99)
+        extra_total = REFRESH_EXTRA_PER_NEW * new_players
+        k = extra_total / early_sum if early_sum > 0 else 0.0
+        refresh_var = 0.04
+        arrivals = None
+    else:
+        p_target = project_players_growth(history, horizon_hours)
+        new_players = max(0.0, p_target - p_last)
+        arrivals = newcomer_rates(history, trophies, classes, horizon_hours)
+        refresh_var = 0.01
+
     rows = []
     for i, trophy in enumerate(trophies):
         r_last = rates[i]
         cls = classes[i]
-        lam, lag, _m0, ceiling = CLASSES[cls]
-        m_i = arrivals[i]
+        lam, lag, ceiling = CLASSES[cls]
 
         if r_last >= 99.99:
             # Structurally universal trophy: stays at ~100%.
             rows.append({"id": trophy["id"],
-                         "q": [99.9, 99.99, 100, 100, 100]})
+                         "q": [99.99, 99.99, 100, 100, 100]})
             continue
 
         e_last = r_last / 100.0 * p_last
-        prog_exist = (p_last - e_last) * (
-            1.0 - math.exp(-lam * max(0.0, horizon_hours - lag)))
-        prog_new = 1.0 - math.exp(
-            -lam * max(0.0, horizon_hours / 2.0 - lag))
-        beta = m_i + (1.0 - m_i) * prog_new
-        e_target = e_last + prog_exist + new_players * beta
+        if flat:
+            # Refresh jump (tilted earners), then hazard progression of
+            # the whole post-refresh population over the horizon.
+            g = 1.0 + k if early[i] else 1.0
+            e_base = e_last * g
+            prog = (p_target - e_base) * (
+                1.0 - math.exp(-lam * max(0.0, horizon_hours - lag)))
+            e_target = e_base + prog
+        else:
+            m_i = arrivals[i]
+            prog_exist = (p_last - e_last) * (
+                1.0 - math.exp(-lam * max(0.0, horizon_hours - lag)))
+            prog_new = 1.0 - math.exp(
+                -lam * max(0.0, horizon_hours / 2.0 - lag))
+            beta = m_i + (1.0 - m_i) * prog_new
+            e_target = e_last + prog_exist + new_players * beta
         median = 100.0 * e_target / p_target if p_target > 0 else r_last
         median = min(median, ceiling)
         median = clamp_pct(median)
 
         move = abs(logit(median) - logit(r_last))
-        sigma = math.sqrt(0.25 * days + extra * extra + (0.15 * move) ** 2)
+        sigma = math.sqrt(0.05 + 0.10 * days + refresh_var
+                          + (0.05 * move) ** 2)
         centre = logit(median)
         qs = [round4(clamp_pct(inv_logit(centre + z * sigma))) for z in Z]
         # Keep the row non-decreasing after rounding.
-        for k in range(1, 5):
-            if qs[k] < qs[k - 1]:
-                qs[k] = qs[k - 1]
+        for j in range(1, 5):
+            if qs[j] < qs[j - 1]:
+                qs[j] = qs[j - 1]
         rows.append({"id": trophy["id"], "q": qs})
     return {"trophies": rows}
 
